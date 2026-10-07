@@ -13,6 +13,7 @@
 
 #include <unordered_set>
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <span>
@@ -198,6 +199,21 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	struct FastDrawKey {
+		uint64_t low                                  = 0;
+		uint64_t high                                 = 0;
+		bool     operator==(const FastDrawKey&) const = default;
+	};
+	struct FastDrawKeyHash {
+		std::size_t operator()(const FastDrawKey& key) const noexcept {
+			return static_cast<std::size_t>(key.low ^ key.high);
+		}
+	};
+	[[nodiscard]] FastDrawKey MakeFastDrawKey(const CommandBuffer&  buffer,
+	                                          vk::PrimitiveTopology topology,
+	                                          uint32_t render_target_slice_offset) const;
+	[[nodiscard]] bool        TryFastSkipDraw(CommandBuffer& buffer, vk::PrimitiveTopology topology,
+	                                          uint32_t render_target_slice_offset);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -224,7 +240,8 @@ private:
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         uint32_t render_target_slice_offset,
+	                         bool primitive_restart_enable, bool indirect);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -246,6 +263,10 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
+	// Learned only after the full group check selected a draw for suppression.
+	std::unordered_set<FastDrawKey, FastDrawKeyHash> m_fast_draw_keys;
+	std::unordered_set<uint64_t>                     m_fast_draw_shader_addresses;
+	uint64_t                                         m_fast_skipped_draws = 0;
 
 	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
+#include "graphics/host_gpu/renderer/gpuWorkloadCapture.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -47,6 +48,26 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+static bool CaptureDispatch(RenderContext& context, const auto& program,
+                            std::array<uint32_t, 3> groups, bool indirect) {
+	auto& capture = GpuWorkloadCapture::Instance();
+	if (!capture.ComputeEnabled()) return false;
+	ComputeWorkload work {};
+	work.shader_hash = program.shader_hash;
+	work.groups      = groups;
+	work.indirect    = indirect;
+	for (const auto& image: program.info.images) {
+		if (image.written &&
+		    image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage)
+			++work.storage_images;
+	}
+	for (const auto& resource: program.info.buffers) {
+		if (resource.written) ++work.written_buffers;
+	}
+	return capture.Compute(context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+	                       work);
+}
 
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
@@ -557,6 +578,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     thread_group_z);
 		}
 	}
+	if (CaptureDispatch(m_context, program,
+	                    {input_info.workgroup_counts[0], input_info.workgroup_counts[1],
+	                     input_info.workgroup_counts[2]},
+	                    false)) {
+		ResetBindings();
+		return;
+	}
 
 	buffer.EndRendering();
 	auto& pipeline =
@@ -713,6 +741,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	if (CaptureDispatch(m_context, program, {}, true)) {
+		ResetBindings();
+		return;
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

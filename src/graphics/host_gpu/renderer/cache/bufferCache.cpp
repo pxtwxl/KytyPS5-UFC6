@@ -1147,8 +1147,31 @@ void BufferCache::RunGarbageCollector() {
 		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
-			dirty_buffers.push_back(id);
+			bool has_dirty_bytes = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				has_dirty_bytes = m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+			}
+			// The page tracker can remain dirty after a readback has removed its byte ranges.
+			// Only scan for a new download when dirty bytes are still present.
+			const bool queued = has_dirty_bytes &&
+			                    DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
+			bool pending = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				pending = m_downloading_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+				if (m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+					EXIT("BufferCache: garbage collection left GPU-dirty bytes without a readback\n");
+				}
+			}
+			if (queued || pending) {
+				// The wait below also publishes any readback already in flight.
+				dirty_buffers.push_back(id);
+			} else {
+				m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+				m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+				DeleteBuffer(id);
+			}
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);

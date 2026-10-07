@@ -1,0 +1,440 @@
+PRIMARY TARGET CHANGE
+
+ROLLBACK STATUS (2026-10-07)
+
+The internal-resolution experiment has been reverted after the 960x540
+fight run produced a nearly black scene. Rendering now uses native guest
+image extents. UFC6_INTERNAL_RESOLUTION has no effect and should be removed
+from the launch environment. The nonessential model draw/dispatch suppression
+remains in the renderer. The notes below describe the abandoned experiment
+and are retained for diagnosis; they do not describe the current build.
+
+HISTORICAL IMPLEMENTATION STATUS (2026-10-07)
+
+UFC6_INTERNAL_RESOLUTION=960x540 assigns a 960x540 Vulkan extent to
+classified 1920x1080 scene attachments. Native (or an unset variable)
+retains native rendering. The optional 1920x1080 mode currently serves
+as a diagnostic and leaves these attachments native. Look for "UFC6
+internal resolution active" in _kyty.txt to confirm an attachment was
+actually reduced.
+
+The first scaled game run reached frame 538. Its log shows 1920x1080
+scene attachments scaled at frame 90, then the first 3840x2160
+multi-target scene attachments scaled at frame 538. The GPU reported
+WriteInvalid and device loss in that frame, at a DrawIndex checkpoint.
+The faulting shader/resource is not identified by the dump. Scaling the
+3840x2160 scene group is disabled pending an alias and shader-write
+audit; those passes remain native in the current build.
+
+Classification requires the title ID, a single-sample, single-layer,
+single-mip tiled render target, a matching depth extent, and at least
+three enabled color attachments of the same guest extent. The host must
+support nearest image blits for the attachment and depth format. A
+similarly sized presentation or texture resource is not selected by size
+alone. Other passes remain at their original resolution unless they reuse
+one of the classified guest surfaces.
+
+Guest addresses, pitches, tiling and readback sizes remain native. The
+image model retains a separate host extent for rendering. A native sized
+transfer image is allocated only when a scaled image needs a guest-memory
+upload or readback and is released after the GPU completes that work.
+Alias copies, depth/stencil copies, and single-sample
+resolves resample between differing host extents. Viewports, scissors and
+render areas use the scaled host extent, and the existing presentation
+path upscales a scaled source to the window.
+
+The Release build compiles. A manual run after the 3840x2160 gate
+confirmed that 1920x1080 scene attachments still scale, but ended in
+BufferCache::RunGarbageCollector at bufferCache.cpp:1150 while entering
+the fight. The new _kyty.txt has no device fault; its older
+_device_fault.nv-gpudmp is from the prior 3840x2160 run. The collector
+mistook a GPU-dirty tracker page with no new bytes to copy for a failed
+readback. It now waits for any readback already in flight, or clears a
+stale page state when no dirty bytes remain. It also skips scanning a
+large buffer when there are no bytes to download. The next manual run
+reached the fight without that abort.
+
+The next manual 960x540 fight run reached frame 2413 and improved FPS,
+but the scene was heavily blurred and fighter textures had rectangular
+patches. The same fight at Native resolution looks normal, so this is a
+scaling regression. The image cache previously converted a native image
+to a scaled attachment but reused that smaller image for later native
+render target, storage, and sampled texture bindings. Native texture
+descriptors can be read with guest pixel coordinates, so a 1920x1080
+read from a 960x540 image can sample the wrong texels or run out of
+bounds. The cache now converts in both directions for every binding
+type and logs the first 32 extent transitions. The corrected Release
+build is installed; its visual result needs a fresh 960x540 fight check.
+The most recent _kyty.txt was from the Native comparison and has no
+internal-resolution lines. If the blur remains after this build,
+investigate pixel shader screen coordinates within the scaled pass;
+do not treat the screenshot as expected upscaling.
+
+A fresh 960x540 run with native sampled-texture conversion showed repeated
+1920x1080 -> 960x540 attachment transitions and 960x540 -> 1920x1080
+texture transitions. It then failed before the fight in Buffer::Buffer:
+VMA could not allocate a device-local buffer. The log shows a 980 MB
+merged guest buffer mirror repeatedly recreated for requests a few pages
+to its left; heap 0 reported 5.67 GB usage against a 3.53 GB budget.
+Large mirrors now reserve up to 4 MB of left-side space without crossing
+another buffer, avoiding those repeated near-gigabyte reallocations. If
+device-local allocation still fails, the buffer allocator retries in
+host-preferred memory and logs the result and requested size. This builds
+in Release and awaits another manual fight run. Image quality after the
+texture conversion has not yet been verified because that run crashed.
+
+The 60-frame fight capture in _Build/windows/install/ufc6-gpu-summary.txt
+shows 130 graphics groups and 91,596 draws at 1920x1080, versus eight
+groups and 1,380 draws at 3840x2160. Thus the 3840x2160 assumption above
+does not describe most scene draws in that capture. The current 960x540
+mode scales classified 1920x1080 scene attachments by 0.5. The 3840x2160
+scene attachments and other non-scene resources keep their native extent.
+
+The next manual run did produce 136 attachment candidate lines. At frame
+858, a 1920x1080 scene-shaped pass binds six color attachments (formats
+64,43,37,122,95,95) with a matching depth target. Frame 834 also has a
+3840x2160 multi-target pass with matching depth, so 3840x2160 cannot be
+treated solely as final presentation. Address 0x000000123a000000 appears with both
+1920x1080 and 3840x2160 views, so guest address alone is not a valid
+scaling classification.
+
+Replace the previous 800×600 target with:
+
+UFC 6 INTERNAL RENDER RESOLUTION:
+
+960 × 540
+
+This is now the primary and intended UltraLow internal resolution.
+
+============================================================
+WHY 960×540
+============================================================
+
+960×540 preserves the native 16:9 aspect ratio.
+
+Assuming the guest scene is 3840×2160:
+
+Guest:
+3840 × 2160
+= 8,294,400 pixels
+
+Host:
+960 × 540
+= 518,400 pixels
+
+Scale:
+
+X = 960 / 3840
+  = 0.25
+
+Y = 540 / 2160
+  = 0.25
+
+Therefore:
+
+hostWidth  = guestWidth  × 0.25
+hostHeight = guestHeight × 0.25
+
+Pixel workload:
+
+518,400 / 8,294,400
+= 0.0625
+
+Therefore the 960×540 target contains exactly:
+
+1/16
+
+the pixels of 3840×2160.
+
+IMPORTANT:
+
+This does NOT mean the game will become 16× faster.
+
+Only workloads whose cost actually scales with internal resolution
+benefit proportionally.
+
+============================================================
+IMPLEMENTATION TARGET
+============================================================
+
+The desired architecture is:
+
+UFC 6 guest
+3840×2160 logical render target
+        |
+        v
+Kyty guest representation
+guestExtent = 3840×2160
+        |
+        v
+UFC6 internal-resolution policy
+        |
+        v
+hostExtent = 960×540
+        |
+        v
+Vulkan scene rendering
+960×540
+        |
+        v
+final upscale
+        |
+        v
+existing presentation resolution
+
+Do NOT simply change:
+
+window size
+
+or:
+
+swapchain size.
+
+Actual resolution-dependent scene rendering must occur at 960×540.
+
+============================================================
+CONFIGURATION
+============================================================
+
+Make internal resolution configurable.
+
+Preferred:
+
+UFC6_INTERNAL_RESOLUTION=960x540
+
+or use the repository's existing configuration mechanism.
+
+Required modes:
+
+Native
+960×540
+
+Optional diagnostic mode:
+
+1920×1080
+
+Do NOT make 800×600 the primary target anymore.
+
+============================================================
+SCALING
+============================================================
+
+When the positively identified guest render target is:
+
+3840×2160
+
+the corresponding host target should become:
+
+960×540.
+
+Because this is uniform 0.25 scaling:
+
+hostX = guestX × 0.25
+hostY = guestY × 0.25
+
+hostWidth  = guestWidth  × 0.25
+hostHeight = guestHeight × 0.25
+
+Apply equivalent transformation to:
+
+viewport
+scissor
+render area
+relevant copy regions
+relevant blit regions
+relevant resolve regions
+
+ONLY when operating on a resource classified as internally scaled.
+
+Do NOT globally multiply all renderer coordinates by 0.25.
+
+============================================================
+VERY IMPORTANT
+============================================================
+
+Do NOT implement:
+
+if (width == 3840 && height == 2160)
+{
+    width = 960;
+    height = 540;
+}
+
+globally.
+
+That is unsafe.
+
+Resolution alone must NOT determine whether an image is scalable.
+
+Classify actual resolution-dependent rendering resources.
+
+Potential candidates:
+
+main scene color
+main scene depth
+G-buffer
+lighting intermediates
+screen-space intermediates
+post-processing intermediates
+
+Do NOT automatically scale:
+
+fighter textures
+normal maps
+material textures
+UI atlases
+LUTs
+cubemaps
+environment maps
+shadow maps
+unknown storage images
+unknown VkImages
+
+============================================================
+MEMORY EXAMPLE
+============================================================
+
+For a simple 32-bit-per-pixel attachment:
+
+3840×2160×4
+≈ 31.64 MiB
+
+960×540×4
+≈ 1.98 MiB
+
+Potential reduction for that individual attachment:
+
+≈ 29.66 MiB
+
+or approximately:
+
+93.75%
+
+This applies only to that attachment and does NOT represent total
+VRAM savings.
+
+If multiple full-resolution:
+
+color
+depth
+G-buffer
+lighting
+post-process
+
+attachments can safely be scaled, total VRAM reduction may become
+substantial.
+
+Measure/report actual affected resources.
+
+============================================================
+PRESERVE 16:9
+============================================================
+
+One reason for selecting 960×540 instead of 800×600 is that no
+intentional aspect-ratio conversion should be required.
+
+3840 / 2160 = 16:9
+
+960 / 540 = 16:9
+
+Therefore the scene should preserve its original proportions.
+
+Do not introduce letterboxing or stretching unless the existing
+presentation architecture requires it.
+
+============================================================
+BENCHMARK PURPOSE
+============================================================
+
+Current manually observed UFC 6 performance is approximately:
+
+5 FPS
+
+which corresponds to approximately:
+
+200 ms/frame.
+
+After implementation I will manually compare:
+
+Native resolution
+vs
+960×540
+
+Record:
+
+FPS
+GPU utilization
+dedicated VRAM
+shared GPU memory
+system RAM
+visual correctness
+
+Do NOT automatically launch UFC 6.
+
+============================================================
+INTERPRETATION
+============================================================
+
+If:
+
+Native ≈ 5 FPS
+
+and:
+
+960×540 produces a substantial improvement,
+
+then resolution-dependent GPU rendering is an important bottleneck.
+
+If:
+
+Native ≈ 5 FPS
+
+and:
+
+960×540 ≈ 5 FPS,
+
+do NOT continue lowering resolution.
+
+That would indicate the dominant bottleneck is likely elsewhere, such
+as:
+
+CPU/GPU synchronization
+guest GPU command processing
+CommandScheduler waits
+BufferCache synchronization
+resource transfers
+shader/pipeline processing
+CPU emulation
+
+============================================================
+BUILD / TEST RULE
+============================================================
+
+Build the Release configuration.
+
+Fix compilation errors introduced by the implementation.
+
+DO NOT RUN TEST CASES.
+
+Do NOT run:
+
+ctest
+unit tests
+integration tests
+renderer tests
+automated gameplay tests
+
+DO NOT automatically launch UFC 6.
+
+I will manually test runtime behavior.
+
+Final report must explicitly state:
+
+Release build:
+PASS/FAIL
+
+Automated tests:
+NOT RUN — per user instruction
+
+UFC 6 runtime:
+NOT RUN — user will manually test

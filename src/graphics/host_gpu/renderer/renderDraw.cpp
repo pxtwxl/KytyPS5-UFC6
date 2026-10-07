@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
+#include "graphics/host_gpu/renderer/gpuWorkloadCapture.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -51,6 +52,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -630,6 +632,78 @@ static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	return output_mask;
 }
 
+RenderExecutor::FastDrawKey
+RenderExecutor::MakeFastDrawKey(const CommandBuffer& buffer, vk::PrimitiveTopology topology,
+                                uint32_t render_target_slice_offset) const {
+	const auto&              ctx     = buffer.GetRegisters();
+	const auto&              shaders = buffer.GetShaders();
+	const auto&              sh      = ctx.GetShaderRegisters();
+	std::array<uint64_t, 80> words {};
+	size_t                   used        = 0;
+	const auto               add         = [&](uint64_t value) { words[used++] = value; };
+	const auto               shader_hash = [](uint64_t address) {
+		return address == 0 ? 0ull : ShaderDeclaredHash(address);
+	};
+	add(1); // Key version.
+	add(static_cast<uint32_t>(topology));
+	add(render_target_slice_offset);
+	add(ctx.GetShaderStages());
+	add(shader_hash(shaders.GetVs().es_regs.data_addr));
+	add(shader_hash(shaders.GetVs().gs_regs.data_addr));
+	add(shader_hash(shaders.GetVs().ls_regs.data_addr));
+	add(shader_hash(shaders.GetVs().hs_regs.data_addr));
+	add(shader_hash(shaders.GetPs().ps_regs.data_addr));
+	const auto color_mask = DrawColorOutputMask(ctx);
+	add(color_mask);
+	add(sh.db_shader_control.shader_kill_enable |
+	    (static_cast<uint32_t>(sh.db_shader_control.shader_z_export_enable) << 1u) |
+	    (static_cast<uint32_t>(sh.db_shader_control.shader_mask_export_enable) << 2u) |
+	    (static_cast<uint32_t>(sh.db_shader_control.shader_dual_export_enable) << 3u) |
+	    (static_cast<uint32_t>(sh.db_shader_control.shader_execute_on_noop) << 4u));
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+		if ((color_mask & (1u << slot)) == 0) continue;
+		const auto& rt = ctx.GetRenderTarget(slot);
+		add(slot);
+		add(rt.base.addr != 0);
+		add(static_cast<uint32_t>(rt.info.format) |
+		    (static_cast<uint64_t>(rt.info.channel_type) << 16u) |
+		    (static_cast<uint64_t>(rt.info.channel_order) << 32u));
+		add(static_cast<uint64_t>(rt.attrib2.width) |
+		    (static_cast<uint64_t>(rt.attrib2.height) << 32u));
+		add(rt.view.current_mip_level);
+	}
+	const auto& depth = ctx.GetDepthRenderTarget();
+	const auto& dc    = ctx.GetDepthControl();
+	const auto& rc    = ctx.GetRenderControl();
+	add(static_cast<uint32_t>(depth.z_info.format) |
+	    (static_cast<uint64_t>(depth.stencil_info.format) << 16u));
+	add(static_cast<uint64_t>(depth.size.x_max) | (static_cast<uint64_t>(depth.size.y_max) << 32u));
+	add(depth.size.valid);
+	add(depth.z_read_base_addr != 0);
+	add(dc.z_enable | (static_cast<uint32_t>(dc.z_write_enable) << 1u) |
+	    (static_cast<uint32_t>(dc.depth_bounds_enable) << 2u) |
+	    (static_cast<uint32_t>(dc.stencil_enable) << 3u) |
+	    (static_cast<uint32_t>(rc.depth_clear_enable) << 4u) |
+	    (static_cast<uint32_t>(rc.stencil_clear_enable) << 5u) |
+	    (static_cast<uint32_t>(depth.depth_view.depth_write_disable) << 6u));
+	const auto hash = XXH3_128bits(words.data(), used * sizeof(uint64_t));
+	return {hash.low64, hash.high64};
+}
+
+bool RenderExecutor::TryFastSkipDraw(CommandBuffer& buffer, vk::PrimitiveTopology topology,
+                                     uint32_t render_target_slice_offset) {
+	if (!GpuWorkloadCapture::Instance().FastGraphicsEnabled() || m_fast_draw_keys.empty() ||
+	    !m_fast_draw_shader_addresses.contains(buffer.GetShaders().GetVs().es_regs.data_addr) ||
+	    !m_fast_draw_keys.contains(MakeFastDrawKey(buffer, topology, render_target_slice_offset))) {
+		return false;
+	}
+	ResetBindings();
+	if (++m_fast_skipped_draws == 1 || m_fast_skipped_draws % 100000 == 0) {
+		LOGF("UFC6 GPU early graphics skips=%" PRIu64 "\n", m_fast_skipped_draws);
+	}
+	return true;
+}
+
 enum class CbColorMode : uint8_t {
 	Disable            = 0,
 	Normal             = 1,
@@ -653,8 +727,8 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 }
 
 struct DrawEmitInfo {
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
+	int32_t  vertex_offset  = 0;
+	uint32_t first_vertex   = 0;
 	uint32_t first_instance = 0;
 	// Nonzero: a draw whose counts the GPU reads from these guest DrawIndirectArgs.
 	uint64_t gpu_args_address = 0;
@@ -1157,10 +1231,57 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+	                                     uint32_t render_target_slice_offset,
+	                                     bool primitive_restart_enable, bool indirect) {
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	auto& capture = GpuWorkloadCapture::Instance();
+	if (capture.GraphicsEnabled()) {
+		GraphicsWorkload work {};
+		for (uint32_t i = 0; i < vertex_stages.size(); ++i)
+			work.shader_hashes[i] = vertex_stages[i].stage.program->shader_hash;
+		work.shader_hashes[3] =
+		    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+		work.topology    = static_cast<uint32_t>(topology);
+		work.color_count = state.color_count;
+		for (uint32_t i = 0; i < state.color_count; ++i)
+			work.color_formats[i] =
+			    static_cast<uint32_t>(state.color_info[i].desc.view_info.format);
+		work.depth_format = state.depth_info.image_id
+		                        ? static_cast<uint32_t>(state.depth_info.desc.view_info.format)
+		                        : 0;
+		work.depth_flags  = static_cast<uint32_t>(state.depth_info.depth_test_enable) |
+		                    (static_cast<uint32_t>(state.depth_info.depth_write_enable) << 1u);
+		if (state.depth_info.image_id) {
+			work.depth_layers = state.depth_info.desc.info.resources.layers;
+			work.depth_address = state.depth_info.desc.info.data.address;
+		}
+		if (state.color_count != 0) {
+			const auto extent = state.color_info[0].Extent();
+			work.width        = extent.width;
+			work.height       = extent.height;
+		} else if (state.depth_info.image_id) {
+			work.width  = state.depth_info.desc.info.extent.width;
+			work.height = state.depth_info.desc.info.extent.height;
+		}
+		work.count     = draw.index_count;
+		work.instances = emit.gpu_instance_count_address != 0 ? 0 : draw.instance_count;
+		work.indexed   = draw.IsIndexed();
+		work.indirect =
+		    indirect || emit.gpu_args_address != 0 || emit.gpu_instance_count_address != 0;
+		work.count_known     = emit.gpu_args_address == 0;
+		work.instances_known = emit.gpu_args_address == 0 && emit.gpu_instance_count_address == 0;
+		if (capture.Graphics(
+		        m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), work)) {
+			if (capture.FastGraphicsGroup(work)) {
+				m_fast_draw_keys.insert(
+				    MakeFastDrawKey(buffer, topology, render_target_slice_offset));
+				m_fast_draw_shader_addresses.insert(buffer.GetShaders().GetVs().es_regs.data_addr);
+			}
+			return;
+		}
+	}
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
@@ -1531,6 +1652,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (!GetDrawTopology(ucfg, topology)) {
 		return;
 	}
+	if (TryFastSkipDraw(buffer, topology, args.render_target_slice_offset)) return;
 
 	DrawIndexBufferSource index_source {};
 	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
@@ -1586,7 +1708,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	               emit.first_instance, indirect);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
+	                    args.render_target_slice_offset, primitive_restart, indirect);
 	ResetBindings();
 }
 
@@ -1648,6 +1770,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
+	if (TryFastSkipDraw(buffer, topology, args.render_target_slice_offset)) return;
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1721,7 +1844,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	               static_cast<int32_t>(emit.first_vertex), emit.first_instance, indirect);
 
 	DrawIndexBufferSource index_source {};
-	ExecutePreparedDraw(submit_id, buffer, drawn_info, state, topology, emit, index_source, false);
+	ExecutePreparedDraw(submit_id, buffer, drawn_info, state, topology, emit, index_source,
+	                    args.render_target_slice_offset, false, indirect);
 	ResetBindings();
 }
 
